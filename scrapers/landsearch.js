@@ -34,8 +34,12 @@ export async function scrapeLandsearch({ states, counties, maxPrice, minPrice, m
     const slug = STATE_SLUGS[state.toLowerCase()];
     if (!slug) continue;
 
-    const priceSlug = getPriceSlug(maxPrice);
-    const url = `${BASE_URL}/properties/${slug}/search${priceSlug}`;
+    // LandSearch working URL pattern: /properties/STATE?min_acres=X&max_price=Y
+    const params = new URLSearchParams();
+    if (minAcres > 0) params.set('min_acres', String(minAcres));
+    if (maxPrice) params.set('max_price', String(maxPrice));
+    const queryStr = params.toString() ? `?${params.toString()}` : '';
+    const url = `${BASE_URL}/properties/${slug}${queryStr}`;
     console.log(`  [LandSearch] Fetching ${url}`);
 
     try {
