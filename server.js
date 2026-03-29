@@ -11,16 +11,28 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Health check
+// Health check — multiple paths for compatibility
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'AADreamland Land Scraper API',
-    version: '1.0.0',
+    version: '2.0.0',
+    uptime: process.uptime(),
+    scrapers: ['LandWatch', 'Landmodo', 'LandSearch', 'LandFlip'],
     endpoints: {
       search: 'POST /api/search',
-      health: 'GET /api/health',
+      searchStream: 'GET /api/search/stream',
+      health: 'GET /health',
     }
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    scrapers: ['LandWatch', 'Landmodo', 'LandSearch', 'LandFlip'],
   });
 });
 
@@ -99,6 +111,57 @@ app.post('/api/search', async (req, res) => {
       timestamp: new Date().toISOString(),
     }
   });
+});
+
+// GET search endpoint (JSON) — for simple queries
+app.get('/api/search', async (req, res) => {
+  const { states: rawStates, counties: rawCounties, maxPrice, minAcres, maxAcres, ownerFinancing } = req.query;
+  const stateList = rawStates ? (Array.isArray(rawStates) ? rawStates : rawStates.split(',')) : [];
+  const countyList = rawCounties ? (Array.isArray(rawCounties) ? rawCounties : rawCounties.split(',')) : [];
+
+  if (stateList.length === 0) {
+    return res.status(400).json({ error: 'states parameter required' });
+  }
+
+  const criteria = {
+    states: stateList,
+    counties: countyList,
+    maxPrice: parseInt(maxPrice) || 50000,
+    minPrice: 0,
+    minAcres: parseFloat(minAcres) || 0,
+    maxAcres: parseFloat(maxAcres) || 1000,
+    ownerFinancing: ownerFinancing === 'true',
+  };
+
+  console.log(`[SEARCH GET] states=${stateList.join(',')}, maxPrice=${maxPrice}`);
+  const allResults = [];
+  const scraperList = [
+    { name: 'LandWatch', fn: scrapeLandwatch },
+    { name: 'Landmodo', fn: scrapeLandmodo },
+    { name: 'LandSearch', fn: scrapeLandsearch },
+    { name: 'LandFlip', fn: scrapeLandflip },
+  ];
+
+  for (const s of scraperList) {
+    try {
+      const results = await s.fn(criteria);
+      allResults.push(...results);
+      console.log(`[SEARCH GET] ${s.name}: ${results.length} results`);
+    } catch (err) {
+      console.error(`[SEARCH GET] ${s.name} error:`, err.message);
+    }
+  }
+
+  const seen = new Set();
+  const unique = allResults.filter(p => {
+    const key = (p.listingUrl || p.title || '').toLowerCase().substring(0, 60);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  unique.sort((a, b) => (a.price || 999999) - (b.price || 999999));
+
+  res.json({ results: unique, totalResults: unique.length });
 });
 
 // Streaming search endpoint (Server-Sent Events for real-time progress)

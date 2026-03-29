@@ -2,192 +2,212 @@ import * as cheerio from 'cheerio';
 
 const BASE_URL = 'https://www.landwatch.com';
 
-const STATE_SLUGS = {
-  'oklahoma': 'oklahoma',
-  'missouri': 'missouri',
-  'arkansas': 'arkansas',
-  'texas': 'texas',
-  'kansas': 'kansas',
-  'tennessee': 'tennessee',
-  'kentucky': 'kentucky',
-  'illinois': 'illinois',
-};
+// Support ALL US states - dynamically convert state name to slug
+function getStateSlug(state) {
+  return state.toLowerCase().replace(/\s+/g, '-');
+}
 
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Cache-Control': 'no-cache',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'DNT': '1',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Cache-Control': 'max-age=0',
 };
 
-export async function scrapeLandwatch({ states, counties, maxPrice, minPrice, minAcres, maxAcres }) {
+export async function scrapeLandwatch({ states, counties, maxPrice, minPrice, minAcres, maxAcres, ownerFinancing }) {
   const results = [];
 
   for (const state of states) {
-    const slug = STATE_SLUGS[state.toLowerCase()];
-    if (!slug) continue;
+    const stateSlug = getStateSlug(state);
+    console.log(`[LandWatch] Processing state: ${state} (slug: ${stateSlug})`);
 
-    // LandWatch working URL pattern: /{state}-land-for-sale
-    // Price and acre filters are query params, not URL slugs
-    const baseSearchUrl = `${BASE_URL}/${slug}-land-for-sale`;
+    // Build base URL with state slug
+    let url = `${BASE_URL}/${stateSlug}-land-for-sale`;
 
-    // Try multiple URL approaches
-    const urlsToTry = [
-      baseSearchUrl,
-      `${baseSearchUrl}?minPrice=${minPrice || 0}&maxPrice=${maxPrice}`,
-    ];
+    // Add county filter if specified
+    if (counties && counties.length > 0) {
+      const county = counties[0];
+      const countySlug = county.toLowerCase().replace(/\s+/g, '-');
+      url = `${BASE_URL}/${stateSlug}-land-for-sale/${countySlug}-county`;
+      console.log(`[LandWatch] Using county filter: ${url}`);
+    }
 
-    for (const url of urlsToTry) {
-      console.log(`  [LandWatch] Fetching ${url}`);
-
-      try {
-        const response = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
-        if (!response.ok) {
-          console.log(`  [LandWatch] HTTP ${response.status} for ${url}`);
-          continue;
-        }
-
-        const html = await response.text();
-        const $ = cheerio.load(html);
-
-        // Method 1: Look for JSON-LD structured data
-        $('script[type="application/ld+json"]').each((_, el) => {
-          try {
-            const data = JSON.parse($(el).html());
-
-            // Handle ItemList format
-            if (data['@type'] === 'ItemList' && data.itemListElement) {
-              for (const item of data.itemListElement) {
-                const listing = item.item || item;
-                processListing(listing, state, results, { maxPrice, minPrice, minAcres, maxAcres, counties });
-              }
-            }
-
-            // Handle single listing
-            if (data['@type'] === 'RealEstateListing' || data['@type'] === 'Product') {
-              processListing(data, state, results, { maxPrice, minPrice, minAcres, maxAcres, counties });
-            }
-          } catch {}
-        });
-
-        // Method 2: Parse visible listing text with regex
-        const bodyText = $('body').text();
-        const listingPattern = /\$([\d,]+)\s*[•·]\s*([\d.]+)\s*Acres?/gi;
-        let match;
-        while ((match = listingPattern.exec(bodyText)) !== null) {
-          const price = parseInt(match[1].replace(/,/g, ''));
-          const acres = parseFloat(match[2]);
-
-          if (price > maxPrice || price < (minPrice || 0)) continue;
-          if (minAcres > 0 && acres < minAcres) continue;
-          if (maxAcres < 1000 && acres > maxAcres) continue;
-
-          // Get surrounding context for county/location
-          const start = Math.max(0, match.index - 20);
-          const end = Math.min(bodyText.length, match.index + match[0].length + 300);
-          const context = bodyText.substring(start, end);
-
-          const countyMatch = context.match(/([A-Za-z\s]+)\s*County/i);
-          const county = countyMatch ? countyMatch[1].trim() : 'Unknown';
-          const zipMatch = context.match(/OK\s*,?\s*(\d{5})/);
-          const zip = zipMatch ? zipMatch[1] : '';
-
-          // Apply county filter
-          if (counties && counties.length > 0 && county !== 'Unknown') {
-            if (!counties.some(c => c.toLowerCase() === county.toLowerCase())) continue;
-          }
-
-          const id = `landwatch-text-${price}-${acres}-${results.length}`;
-          if (results.some(r => r.price === price && r.acres === acres)) continue;
-
-          results.push({
-            id,
-            title: `${acres} Acres - ${county} County, OK`,
-            price,
-            acres,
-            county,
-            state,
-            zip,
-            listingUrl: baseSearchUrl,
-            source: 'LandWatch',
-            ownerFinancing: context.toLowerCase().includes('owner financ'),
-            description: context.substring(0, 200).trim(),
-            scrapedAt: new Date().toISOString(),
-          });
-        }
-
-        // Method 3: Parse HTML property links
-        $('a').each((_, el) => {
-          const href = $(el).attr('href') || '';
-          if (!href.match(/\/[a-z-]+-county-[a-z-]+\/\d+/i) &&
-              !href.match(/\/listing\/\d+/) &&
-              !href.match(/\/land-for-sale\/listing\//)) return;
-
-          const title = $(el).text().trim();
-          if (!title || title.length < 5) return;
-
-          const fullUrl = href.startsWith('http') ? href : BASE_URL + href;
-          if (results.some(r => r.listingUrl === fullUrl)) return;
-
-          const parentText = $(el).parent().text() || '';
-          const priceMatch = parentText.match(/\$([\d,]+)/);
-          const acresMatch = parentText.match(/([\d.]+)\s*(?:acres?|ac)/i);
-          const countyMatch = title.match(/([A-Za-z]+)\s*County/i);
-
-          const price = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null;
-          const acres = acresMatch ? parseFloat(acresMatch[1]) : null;
-
-          if (price !== null && (price > maxPrice || price < (minPrice || 0))) return;
-          if (acres !== null && minAcres > 0 && acres < minAcres) return;
-
-          results.push({
-            id: `landwatch-${Date.now()}-${results.length}`,
-            title,
-            price,
-            acres,
-            county: countyMatch ? countyMatch[1] : 'Unknown',
-            state,
-            zip: '',
-            listingUrl: fullUrl,
-            source: 'LandWatch',
-            ownerFinancing: parentText.toLowerCase().includes('owner financ'),
-            description: title,
-            scrapedAt: new Date().toISOString(),
-          });
-        });
-
-        // If we got results, don't try the next URL
-        if (results.length > 0) break;
-
-      } catch (err) {
-        console.error(`  [LandWatch] Error:`, err.message);
+    // Add price filter if maxPrice is under 50k
+    if (maxPrice && maxPrice < 50000) {
+      // Determine price range slug
+      let priceSlug = '/price-under-49999';
+      if (maxPrice < 25000) {
+        priceSlug = '/price-under-24999';
+      } else if (maxPrice < 35000) {
+        priceSlug = '/price-under-34999';
       }
+      url = url + priceSlug;
+      console.log(`[LandWatch] Using price filter: ${url}`);
+    }
+
+    // Add owner financing filter if requested
+    if (ownerFinancing) {
+      url = url + '/owner-financing';
+      console.log(`[LandWatch] Using owner financing filter: ${url}`);
+    }
+
+    console.log(`[LandWatch] Fetching ${url}`);
+
+    try {
+      const response = await fetch(url, {
+        headers: HEADERS,
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (!response.ok) {
+        console.log(`[LandWatch] HTTP ${response.status} for ${url}`);
+        continue;
+      }
+
+      const html = await response.text();
+      console.log(`[LandWatch] Received ${html.length} bytes`);
+
+      const $ = cheerio.load(html);
+
+      // Method 1: Parse JSON-LD structured data first
+      console.log(`[LandWatch] Parsing JSON-LD structured data...`);
+      const jsonLdProcessed = parseJsonLd($, state, results, {
+        maxPrice, minPrice, minAcres, maxAcres, counties
+      });
+      console.log(`[LandWatch] Found ${jsonLdProcessed} listings from JSON-LD`);
+
+      // Method 2: Fallback to HTML card parsing with a[href*="/pid/"] selectors
+      console.log(`[LandWatch] Parsing HTML cards with PID links...`);
+      const htmlProcessed = parseHtmlCards($, state, url, results, {
+        maxPrice, minPrice, minAcres, maxAcres, counties
+      });
+      console.log(`[LandWatch] Found ${htmlProcessed} listings from HTML cards`);
+
+      console.log(`[LandWatch] Total results so far: ${results.length}`);
+
+    } catch (err) {
+      console.error(`[LandWatch] Error fetching ${url}:`, err.message);
     }
   }
 
+  console.log(`[LandWatch] Final result count: ${results.length}`);
   return results;
 }
 
-function processListing(listing, state, results, filters) {
+/**
+ * Parse JSON-LD structured data (ItemList with itemListElement)
+ */
+function parseJsonLd($, state, results, filters) {
+  let processed = 0;
+
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const data = JSON.parse($(el).html());
+      console.log(`[LandWatch] Found JSON-LD type: ${data['@type']}`);
+
+      // Handle ItemList format with itemListElement array
+      if (data['@type'] === 'ItemList' && data.itemListElement && Array.isArray(data.itemListElement)) {
+        console.log(`[LandWatch] Processing ItemList with ${data.itemListElement.length} items`);
+
+        for (const item of data.itemListElement) {
+          const listing = item.item || item;
+          if (processJsonLdListing(listing, state, results, filters)) {
+            processed++;
+          }
+        }
+      }
+
+      // Handle single listing
+      if (data['@type'] === 'RealEstateListing' || data['@type'] === 'Product') {
+        if (processJsonLdListing(data, state, results, filters)) {
+          processed++;
+        }
+      }
+    } catch (err) {
+      console.log(`[LandWatch] Failed to parse JSON-LD:`, err.message);
+    }
+  });
+
+  return processed;
+}
+
+/**
+ * Process individual JSON-LD listing
+ */
+function processJsonLdListing(listing, state, results, filters) {
   const price = listing.offers?.price || listing.price;
   const name = listing.name || '';
   const url = listing.url || '';
-  if (!name) return;
+  const description = listing.description || '';
 
-  const numPrice = price ? parseFloat(price) : null;
-  if (numPrice && (numPrice > filters.maxPrice || numPrice < (filters.minPrice || 0))) return;
+  if (!name) return false;
 
-  const acresMatch = name.match(/([\d.]+)\s*(?:acres?|ac)/i);
+  console.log(`[LandWatch] Processing JSON-LD listing: ${name.substring(0, 50)}`);
+
+  // Parse price
+  const numPrice = price ? parseFloat(String(price).replace(/[$,]/g, '')) : null;
+  if (numPrice !== null) {
+    if (numPrice > (filters.maxPrice || Infinity) || numPrice < (filters.minPrice || 0)) {
+      console.log(`[LandWatch] Filtered out by price: $${numPrice}`);
+      return false;
+    }
+  }
+
+  // Parse acres
+  const acresMatch = name.match(/([\d.]+)\s*acres/i);
   const acres = acresMatch ? parseFloat(acresMatch[1]) : null;
-  if (acres && filters.minAcres > 0 && acres < filters.minAcres) return;
+  if (acres !== null) {
+    if (filters.minAcres > 0 && acres < filters.minAcres) {
+      console.log(`[LandWatch] Filtered out by min acres: ${acres}`);
+      return false;
+    }
+    if (filters.maxAcres < 1000 && acres > filters.maxAcres) {
+      console.log(`[LandWatch] Filtered out by max acres: ${acres}`);
+      return false;
+    }
+  }
 
-  const countyMatch = name.match(/([A-Za-z]+)\s*County/i);
-  const county = countyMatch ? countyMatch[1] : 'Unknown';
+  // Parse county from URL: /{county}-county-{state}-{type}-for-sale/pid/{id}
+  let county = 'Unknown';
+  let pid = null;
+  if (url) {
+    const countyMatch = url.match(/\/([a-z-]+)-county-[a-z-]+-for-sale\/pid\/(\d+)/i);
+    if (countyMatch) {
+      county = countyMatch[1].split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      pid = countyMatch[2];
+    }
+  }
 
-  const fullUrl = url.startsWith('http') ? url : `https://www.landwatch.com${url}`;
+  // Apply county filter
+  if (filters.counties && filters.counties.length > 0) {
+    if (!filters.counties.some(c => c.toLowerCase() === county.toLowerCase())) {
+      console.log(`[LandWatch] Filtered out by county: ${county}`);
+      return false;
+    }
+  }
+
+  // Check for owner financing
+  const hasOwnerFinancing = description.toLowerCase().includes('owner financ') ||
+                           name.toLowerCase().includes('owner financ');
+
+  const fullUrl = url.startsWith('http') ? url : `${BASE_URL}${url}`;
+  const id = pid ? `lw-${pid}` : `lw-${Date.now()}-${results.length}`;
+
+  // Check for duplicates
+  if (results.some(r => r.id === id)) {
+    console.log(`[LandWatch] Skipping duplicate: ${id}`);
+    return false;
+  }
 
   results.push({
-    id: `landwatch-${Date.now()}-${results.length}`,
+    id,
     title: name,
     price: numPrice,
     acres,
@@ -196,8 +216,121 @@ function processListing(listing, state, results, filters) {
     zip: '',
     listingUrl: fullUrl,
     source: 'LandWatch',
-    ownerFinancing: (listing.description || '').toLowerCase().includes('owner financ'),
-    description: (listing.description || name).substring(0, 200),
-    scrapedAt: new Date().toISOString(),
+    ownerFinancing: hasOwnerFinancing,
+    description: description.substring(0, 300),
+    scrapedAt: new Date().toISOString().split('T')[0],
   });
+
+  console.log(`[LandWatch] Added listing: ${id} - ${name.substring(0, 40)}`);
+  return true;
+}
+
+/**
+ * Parse HTML cards with a[href*="/pid/"] selectors (fallback method)
+ */
+function parseHtmlCards($, state, baseUrl, results, filters) {
+  let processed = 0;
+
+  $('a[href*="/pid/"]').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    if (!href) return;
+
+    console.log(`[LandWatch] Found PID link: ${href}`);
+
+    // Extract PID from URL
+    const pidMatch = href.match(/\/pid\/(\d+)/);
+    if (!pidMatch) return;
+    const pid = pidMatch[1];
+
+    // Get the card container
+    let cardElement = $(el);
+    for (let i = 0; i < 5; i++) {
+      cardElement = cardElement.parent();
+      if (!cardElement.length) break;
+    }
+
+    const cardText = cardElement.text() || $(el).parent().text();
+    const cardHtml = cardElement.html() || $(el).parent().html();
+
+    // Parse price - look for $XX,XXX pattern
+    const priceMatch = cardText.match(/\$[\d,]+/);
+    let price = null;
+    if (priceMatch) {
+      price = parseFloat(priceMatch[0].replace(/[$,]/g, ''));
+    }
+
+    if (price !== null) {
+      if (price > (filters.maxPrice || Infinity) || price < (filters.minPrice || 0)) {
+        console.log(`[LandWatch] Filtered out by price: $${price}`);
+        return;
+      }
+    }
+
+    // Parse acres - look for X.XX acres pattern
+    const acresMatch = cardText.match(/([\d.]+)\s*acres/i);
+    let acres = null;
+    if (acresMatch) {
+      acres = parseFloat(acresMatch[1]);
+    }
+
+    if (acres !== null) {
+      if (filters.minAcres > 0 && acres < filters.minAcres) {
+        console.log(`[LandWatch] Filtered out by min acres: ${acres}`);
+        return;
+      }
+      if (filters.maxAcres < 1000 && acres > filters.maxAcres) {
+        console.log(`[LandWatch] Filtered out by max acres: ${acres}`);
+        return;
+      }
+    }
+
+    // Parse location from URL pattern: /{county}-county-{state}-{type}-for-sale/pid/{id}
+    let county = 'Unknown';
+    const countyMatch = baseUrl.match(/\/([a-z-]+)-county-[a-z-]+-for-sale/) ||
+                        href.match(/\/([a-z-]+)-county-[a-z-]+-for-sale/i);
+    if (countyMatch) {
+      county = countyMatch[1].split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    }
+
+    // Apply county filter
+    if (filters.counties && filters.counties.length > 0) {
+      if (!filters.counties.some(c => c.toLowerCase() === county.toLowerCase())) {
+        console.log(`[LandWatch] Filtered out by county: ${county}`);
+        return;
+      }
+    }
+
+    const title = $(el).text().trim() || `${acres ? acres + ' Acres' : 'Property'} - ${county}, ${state}`;
+    const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
+    const id = `lw-${pid}`;
+
+    // Check for duplicates
+    if (results.some(r => r.id === id)) {
+      console.log(`[LandWatch] Skipping duplicate: ${id}`);
+      return;
+    }
+
+    // Check for owner financing
+    const hasOwnerFinancing = cardText.toLowerCase().includes('owner financ');
+
+    results.push({
+      id,
+      title,
+      price,
+      acres,
+      county,
+      state,
+      zip: '',
+      listingUrl: fullUrl,
+      source: 'LandWatch',
+      ownerFinancing: hasOwnerFinancing,
+      description: cardText.substring(0, 300).trim(),
+      scrapedAt: new Date().toISOString().split('T')[0],
+    });
+
+    console.log(`[LandWatch] Added HTML card listing: ${id}`);
+    processed++;
+  });
+
+  return processed;
 }

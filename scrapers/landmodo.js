@@ -20,154 +20,190 @@ const HEADERS = {
   'Cache-Control': 'no-cache',
 };
 
-export async function scrapeLandmodo({ states, counties, maxPrice, minPrice, minAcres, maxAcres }) {
+// Helper to format state name for URL
+function formatStateForUrl(state) {
+  return state.toLowerCase().replace(/\s+/g, '-');
+}
+
+// Helper to parse price from text
+function parsePrice(text) {
+  if (!text) return null;
+  // Remove commas before parsing
+  const cleanText = text.replace(/,/g, '');
+  const match = cleanText.match(/\$\s*([\d]+(?:\.\d{1,2})?)/);
+  if (match) {
+    return parseFloat(match[1]);
+  }
+  return null;
+}
+
+// Helper to extract acres from text
+function extractAcres(text) {
+  if (!text) return null;
+  const match = text.match(/([\d.]+)\s*(?:Acres?)/i);
+  if (match) {
+    return parseFloat(match[1]);
+  }
+  return null;
+}
+
+// Helper to extract location from text
+function extractLocation(text) {
+  if (!text) return { city: null, state: null, zip: null };
+  // Look for pattern: City, ST ZIP
+  const match = text.match(/,\s*([A-Za-z\s]+),\s*([A-Z]{2})\s*(\d{5})/);
+  if (match) {
+    return {
+      city: match[1].trim(),
+      state: match[2],
+      zip: match[3],
+    };
+  }
+  return { city: null, state: null, zip: null };
+}
+
+export async function scrapeLandmodo({ states, counties, maxPrice, minPrice, minAcres, maxAcres, ownerFinancing = true }) {
   const results = [];
 
   for (const state of states) {
-    const stateName = STATE_NAMES[state.toLowerCase()];
-    if (!stateName) continue;
+    const stateUrlFormat = formatStateForUrl(state);
 
-    // Try multiple URL patterns since Landmodo's URLs change
-    const urlsToTry = [
-      `${BASE_URL}/land-for-sale/${state.toLowerCase()}`,
-      `${BASE_URL}/properties/${state.toLowerCase()}`,
-      `${BASE_URL}/state/${state.toLowerCase()}`,
-      `${BASE_URL}/land/${state.toLowerCase()}`,
-      `${BASE_URL}/?state=${stateName}`,
-    ];
+    // Use confirmed working pattern: /properties/{state}
+    const baseUrl = `${BASE_URL}/properties/${stateUrlFormat}`;
 
-    let html = null;
-    let successUrl = null;
+    console.log(`  [Landmodo] Scraping state: ${state}`);
 
-    for (const url of urlsToTry) {
-      console.log(`  [Landmodo] Trying ${url}`);
+    // Scrape up to 3 pages
+    for (let page = 1; page <= 3; page++) {
+      const url = page === 1
+        ? baseUrl
+        : `${baseUrl}?page=${page}`;
+
+      let html = null;
+
       try {
+        console.log(`  [Landmodo] Fetching ${url}`);
         const response = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(10000) });
-        if (response.ok) {
-          const text = await response.text();
-          // Check if it's a real page with property data (not a 404 page)
-          if (!text.includes("can't find this page") && !text.includes('new404') && text.includes('properties')) {
-            html = text;
-            successUrl = url;
-            console.log(`  [Landmodo] Success with ${url}`);
-            break;
-          }
+        if (!response.ok) {
+          console.log(`  [Landmodo] Page ${page} not found or error`);
+          break;
+        }
+        html = await response.text();
+
+        // Check if we got actual content
+        if (!html || html.length < 1000) {
+          console.log(`  [Landmodo] Page ${page} returned empty or minimal content`);
+          break;
         }
       } catch (err) {
-        // Try next URL
+        console.error(`  [Landmodo] Error fetching page ${page}:`, err.message);
+        break;
       }
-    }
 
-    // Also try the main page which lists recent properties
-    if (!html) {
-      console.log(`  [Landmodo] Trying main page`);
-      try {
-        const response = await fetch(BASE_URL, { headers: HEADERS, signal: AbortSignal.timeout(10000) });
-        if (response.ok) {
-          html = await response.text();
-          successUrl = BASE_URL;
-          console.log(`  [Landmodo] Using main page`);
+      const $ = cheerio.load(html);
+
+      // Parse .search_result cards (confirmed HTML class from live site)
+      const searchResults = $('.search_result');
+      console.log(`  [Landmodo] Found ${searchResults.length} search results on page ${page}`);
+
+      if (searchResults.length === 0) {
+        console.log(`  [Landmodo] No results on page ${page}, stopping pagination`);
+        break;
+      }
+
+      searchResults.each((_, cardEl) => {
+        const $card = $(cardEl);
+
+        // Get property link with slug (a[href*="/properties/"])
+        const linkEl = $card.find('a[href*="/properties/"]').first();
+        if (!linkEl.length) return;
+
+        const href = linkEl.attr('href') || '';
+        // Extract slug - should be something like /properties/xyz-title-slug or /properties/state/xyz-slug
+        // Skip state-level pages (e.g., /properties/texas)
+        const match = href.match(/\/properties\/([^/]+)\/([^/]+)/);
+        const simpleMatch = href.match(/\/properties\/([^/]+)$/);
+
+        let slug = null;
+        if (match && match[2]) {
+          // Multi-part URL like /properties/texas/xyz-slug
+          slug = match[2];
+        } else if (simpleMatch && simpleMatch[1] !== stateUrlFormat) {
+          // Single slug, but not the state itself
+          slug = simpleMatch[1];
+        } else {
+          return; // Skip state-level pages
         }
-      } catch (err) {
-        console.error(`  [Landmodo] Main page failed:`, err.message);
-      }
-    }
 
-    if (!html) {
-      console.log(`  [Landmodo] No working URL found for ${state}`);
-      continue;
-    }
+        const fullUrl = href.startsWith('http') ? href : BASE_URL + href;
+        const title = linkEl.text().trim();
 
-    const $ = cheerio.load(html);
+        // Extract price - try .info_section text first, then full card text
+        let price = null;
+        const infoSection = $card.find('.info_section').text();
+        if (infoSection) {
+          price = parsePrice(infoSection);
+        }
+        if (price === null) {
+          const cardText = $card.text();
+          price = parsePrice(cardText);
+        }
 
-    // Find all property links with IDs in URL
-    const propertyLinks = new Map();
+        // Extract acres from title
+        const acres = extractAcres(title);
 
-    $('a[href*="/properties/"]').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      const match = href.match(/\/properties\/(\d{4,})\//);
-      if (!match) return;
+        // Extract location from .post-location-snippet or card text
+        let location = null;
+        const locSnippet = $card.find('.post-location-snippet').text();
+        if (locSnippet) {
+          location = extractLocation(locSnippet);
+        }
+        if (!location || !location.zip) {
+          location = extractLocation($card.text());
+        }
 
-      const propId = match[1];
-      if (propertyLinks.has(propId)) return;
-
-      const title = $(el).text().trim();
-      if (!title || title === 'View More' || title.length < 5) return;
-
-      // Filter by state name in title/URL if we're on the main page
-      if (successUrl === BASE_URL) {
-        const hrefLower = href.toLowerCase();
-        const titleLower = title.toLowerCase();
-        if (!hrefLower.includes(state.toLowerCase()) && !hrefLower.includes('-ok-') &&
-            !titleLower.includes(stateName.toLowerCase()) && !titleLower.includes(', ok')) {
+        // Apply filters
+        // Price: if price=0, KEEP the listing - use l.price === 0 || l.price <= maxPrice
+        if (price !== null && !(price === 0 || price <= maxPrice)) {
           return;
         }
-      }
+        if (price !== null && minPrice && price < minPrice) {
+          return;
+        }
 
-      const fullUrl = href.startsWith('http') ? href : BASE_URL + href;
-      propertyLinks.set(propId, { title, url: fullUrl, propId });
-    });
+        // Acres filter
+        if (acres !== null) {
+          if (minAcres && minAcres > 0 && acres < minAcres) return;
+          if (maxAcres && maxAcres < 1000 && acres > maxAcres) return;
+        }
 
-    // Find prices near property links
-    const priceMap = new Map();
-    $('*').each((_, el) => {
-      const text = $(el).text().trim();
-      if (/^\$[\d,]+(\.\d{2})?$/.test(text)) {
-        let parent = $(el);
-        for (let i = 0; i < 10; i++) {
-          parent = parent.parent();
-          const link = parent.find('a[href*="/properties/"]').first();
-          if (link.length) {
-            const href = link.attr('href') || '';
-            const m = href.match(/\/properties\/(\d{4,})\//);
-            if (m && !priceMap.has(m[1])) {
-              priceMap.set(m[1], parseFloat(text.replace(/[$,]/g, '')));
-            }
-            break;
+        // County filter
+        if (counties && counties.length > 0 && location && location.city) {
+          // Try to match county in location - this is heuristic since we parse city
+          const countyLower = location.city.toLowerCase();
+          if (!counties.some(c => c.toLowerCase() === countyLower)) {
+            // For now, we'll include since county extraction is limited
+            // In a real scenario, you'd need better county detection
           }
         }
-      }
-    });
 
-    // Combine property data
-    for (const [propId, prop] of propertyLinks) {
-      const price = priceMap.get(propId) || null;
+        // Build result object
+        const listing = {
+          id: `lm-${slug}`,
+          title,
+          price,
+          acres,
+          county: location && location.city ? location.city : 'Unknown',
+          state,
+          zip: location && location.zip ? location.zip : '',
+          listingUrl: fullUrl,
+          source: 'Landmodo',
+          ownerFinancing: ownerFinancing !== false ? true : ownerFinancing,
+          description: title,
+          scrapedAt: new Date().toISOString().split('T')[0], // YYYY-MM-DD format
+        };
 
-      const acresMatch = prop.title.match(/([\d.]+)\s*(?:-?\s*)?Acres?/i) ||
-                         prop.title.match(/([\d.]+)\s*(?:-?\s*)?acre/i);
-      const acres = acresMatch ? parseFloat(acresMatch[1]) : null;
-
-      const locMatch = prop.title.match(/,\s*([A-Za-z\s.]+),\s*OK\s*(\d+)/);
-      const countyInTitle = prop.title.match(/([A-Za-z]+)\s*County/i);
-      const county = countyInTitle ? countyInTitle[1] : (locMatch ? locMatch[1].trim() : null);
-      const zip = locMatch ? locMatch[2] : (prop.title.match(/\b(\d{5})\b/) || [])[1] || '';
-
-      // Apply filters
-      if (price !== null) {
-        if (price > maxPrice || price < (minPrice || 0)) continue;
-      }
-      if (acres !== null) {
-        if (minAcres > 0 && acres < minAcres) continue;
-        if (maxAcres < 1000 && acres > maxAcres) continue;
-      }
-      if (counties && counties.length > 0 && county) {
-        const countyLower = county.toLowerCase();
-        if (!counties.some(c => c.toLowerCase() === countyLower)) continue;
-      }
-
-      results.push({
-        id: `landmodo-${propId}`,
-        title: prop.title,
-        price,
-        acres,
-        county: county || 'Unknown',
-        state,
-        zip: zip || '',
-        listingUrl: prop.url,
-        source: 'Landmodo',
-        ownerFinancing: true,
-        description: prop.title,
-        scrapedAt: new Date().toISOString(),
+        results.push(listing);
       });
     }
   }
